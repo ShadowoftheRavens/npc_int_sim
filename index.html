@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dynamic NPC Interaction Simulator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300;1,400&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="vignette"></div>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="header-sigil">⚔</div>
+      <div class="header-text">
+        <h1 class="site-title">NPC Interaction Simulator</h1>
+        <p class="site-subtitle">Dynamic Faction Engine</p>
+      </div>
+
+      <!-- Toolbar -->
+      <div class="header-toolbar">
+        <button id="btn-import-npcs" class="toolbar-btn toolbar-btn-import" title="Import NPC characters">
+          📁 Import NPCs
+        </button>
+        <button id="btn-import-factions" class="toolbar-btn toolbar-btn-import-factions" title="Import factions">
+          🏰 Import Factions
+        </button>
+        <button id="btn-open-faction-builder" class="toolbar-btn toolbar-btn-faction" title="Open Faction Builder">
+          🏰 New Faction
+        </button>
+        <button id="btn-open-builder" class="toolbar-btn toolbar-btn-builder" title="Open Character Builder">
+          ✦ New Character
+        </button>
+        <button id="btn-export-npcs" class="toolbar-btn toolbar-btn-export" title="Export all custom NPCs">
+          ↓ Export
+        </button>
+        <button id="btn-theme-toggle" class="toolbar-btn toolbar-btn-theme" title="Toggle light and dark mode">
+          ☾ Dark
+        </button>
+        <button id="btn-reset" class="btn-reset" title="Reset all data">↺ Reset</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-layout">
+    <!-- Left: NPC Cards -->
+    <section class="panel panel-npcs" aria-label="NPC Roster">
+      <h2 class="panel-title"><span class="panel-icon">👤</span> NPC Roster</h2>
+      <div class="npc-panel-controls">
+        <input 
+          id="npc-search" 
+          type="text" 
+          class="npc-search-input" 
+          placeholder="Search by name…" 
+          autocomplete="off"
+        />
+        <select id="npc-faction-filter" class="npc-faction-filter">
+          <option value="">All Factions</option>
+        </select>
+        <label class="npc-dead-filter-toggle" for="npc-include-dead">
+          <input id="npc-include-dead" type="checkbox" checked />
+          <span>Include Dead</span>
+        </label>
+      </div>
+      <div id="npc-list" class="npc-list"></div>
+    </section>
+
+    <!-- Right column -->
+    <aside class="side-column">
+      <section class="panel panel-factions" aria-label="Faction Reputation">
+        <h2 class="panel-title"><span class="panel-icon">🏰</span> Faction Standing</h2>
+        <div id="reputation-list" class="reputation-list"></div>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
