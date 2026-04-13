@@ -298,6 +298,7 @@ function collectForm(existing = null) {
     affiliatedFactions,
     hatedFactions,
     memory: existing?.memory ?? [],
+    notes: existing?.notes ?? "",
     state:  existing?.state  ?? { mood: "neutral" }
   };
 }
@@ -419,7 +420,7 @@ export function openCreateModal() {
     name: "", role: "", factionId: "", traits: [], affiliatedFactions: [], hatedFactions: [], dead: false,
     stats:       { trust: 50, fear: 20, respect: 50 },
     personality: { brave: 50, greed: 50, loyalty: 50, aggression: 50 },
-    memory: [], state: { mood: "neutral" }
+    memory: [], notes: "", state: { mood: "neutral" }
   });
 
   open();

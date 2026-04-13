@@ -4,11 +4,61 @@ export const initialData = {
   system: {
     stats: ["trust", "fear", "respect", "readiness"],
     actions: [
-      { id: "help",     label: "Help",     effects: { trust: 10, fear: -5, respect: 8 } },
-      { id: "charm",    label: "Charm",    effects: { trust: 14, fear: -8, respect: 10 } },
-      { id: "threaten", label: "Threaten", effects: { fear: 15, trust: -5, respect: -8 } },
-      { id: "betray",   label: "Betray",   effects: { trust: -14, respect: -14, fear: 6 } },
-      { id: "pay",      label: "Pay",      effects: { trust: 5 } }
+      {
+        id: "help",
+        label: "Help",
+        effects: { trust: 10, fear: -5, respect: 8 },
+        ranges: {
+          trust: { min: 10, max: 10, enabled: true },
+          fear: { min: -5, max: -5, enabled: true },
+          respect: { min: 8, max: 8, enabled: true },
+          readiness: { min: 0, max: 0, enabled: false }
+        }
+      },
+      {
+        id: "charm",
+        label: "Charm",
+        effects: { trust: 14, fear: -8, respect: 10 },
+        ranges: {
+          trust: { min: 14, max: 14, enabled: true },
+          fear: { min: -8, max: -8, enabled: true },
+          respect: { min: 10, max: 10, enabled: true },
+          readiness: { min: 0, max: 0, enabled: false }
+        }
+      },
+      {
+        id: "threaten",
+        label: "Threaten",
+        effects: { fear: 15, trust: -5, respect: -8 },
+        ranges: {
+          fear: { min: 15, max: 15, enabled: true },
+          trust: { min: -5, max: -5, enabled: true },
+          respect: { min: -8, max: -8, enabled: true },
+          readiness: { min: 0, max: 0, enabled: false }
+        }
+      },
+      {
+        id: "betray",
+        label: "Betray",
+        effects: { trust: -14, respect: -14, fear: 6 },
+        ranges: {
+          trust: { min: -14, max: -14, enabled: true },
+          respect: { min: -14, max: -14, enabled: true },
+          fear: { min: 6, max: 6, enabled: true },
+          readiness: { min: 0, max: 0, enabled: false }
+        }
+      },
+      {
+        id: "pay",
+        label: "Pay",
+        effects: { trust: 5 },
+        ranges: {
+          trust: { min: 5, max: 5, enabled: true },
+          fear: { min: 0, max: 0, enabled: false },
+          respect: { min: 0, max: 0, enabled: false },
+          readiness: { min: 0, max: 0, enabled: false }
+        }
+      }
     ]
   },
   factions: [
@@ -41,6 +91,7 @@ export const initialData = {
       affiliatedFactions: ["faction_5"],
       hatedFactions: ["faction_3"],
       memory: [],
+      notes: "",
       state: { mood: "neutral" }
     },
     {
@@ -54,6 +105,7 @@ export const initialData = {
       affiliatedFactions: ["faction_4"],
       hatedFactions: ["faction_3"],
       memory: [],
+      notes: "",
       state: { mood: "neutral" }
     },
     {
@@ -67,6 +119,7 @@ export const initialData = {
       affiliatedFactions: ["faction_2"],
       hatedFactions: ["faction_3"],
       memory: [],
+      notes: "",
       state: { mood: "neutral" }
     },
     {
@@ -80,6 +133,7 @@ export const initialData = {
       affiliatedFactions: ["faction_1", "faction_5"],
       hatedFactions: ["faction_6"],
       memory: [],
+      notes: "",
       state: { mood: "pleased" }
     },
     {
@@ -93,6 +147,7 @@ export const initialData = {
       affiliatedFactions: ["faction_6"],
       hatedFactions: ["faction_1", "faction_2"],
       memory: [],
+      notes: "",
       state: { mood: "hostile" }
     },
     {
@@ -106,6 +161,7 @@ export const initialData = {
       affiliatedFactions: ["faction_3"],
       hatedFactions: ["faction_4", "faction_5"],
       memory: [],
+      notes: "",
       state: { mood: "wary" }
     },
     {
@@ -119,6 +175,7 @@ export const initialData = {
       affiliatedFactions: ["faction_2"],
       hatedFactions: ["faction_6"],
       memory: [],
+      notes: "",
       state: { mood: "neutral" }
     },
     {
@@ -132,6 +189,7 @@ export const initialData = {
       affiliatedFactions: ["faction_6"],
       hatedFactions: ["faction_1", "faction_4"],
       memory: [],
+      notes: "",
       state: { mood: "hostile" }
     },
     {
@@ -145,6 +203,7 @@ export const initialData = {
       affiliatedFactions: ["faction_4"],
       hatedFactions: ["faction_3"],
       memory: [],
+      notes: "",
       state: { mood: "afraid" }
     },
     {
@@ -159,6 +218,7 @@ export const initialData = {
       affiliatedFactions: ["faction_1"],
       hatedFactions: ["faction_6"],
       memory: [],
+      notes: "",
       state: { mood: "neutral" }
     }
   ]

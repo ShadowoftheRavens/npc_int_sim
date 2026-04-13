@@ -23,25 +23,44 @@
 
       <!-- Toolbar -->
       <div class="header-toolbar">
-        <button id="btn-import-npcs" class="toolbar-btn toolbar-btn-import" title="Import NPC characters">
-          📁 Import NPCs
-        </button>
-        <button id="btn-import-factions" class="toolbar-btn toolbar-btn-import-factions" title="Import factions">
-          🏰 Import Factions
-        </button>
-        <button id="btn-open-faction-builder" class="toolbar-btn toolbar-btn-faction" title="Open Faction Builder">
-          🏰 New Faction
-        </button>
-        <button id="btn-open-builder" class="toolbar-btn toolbar-btn-builder" title="Open Character Builder">
-          ✦ New Character
-        </button>
-        <button id="btn-export-npcs" class="toolbar-btn toolbar-btn-export" title="Export all custom NPCs">
-          ↓ Export
-        </button>
-        <button id="btn-theme-toggle" class="toolbar-btn toolbar-btn-theme" title="Toggle light and dark mode">
-          ☾ Dark
-        </button>
-        <button id="btn-reset" class="btn-reset" title="Reset all data">↺ Reset</button>
+        <!-- First line: Tools -->
+        <div class="toolbar-row">
+          <button id="btn-open-builder" class="toolbar-btn toolbar-btn-builder" data-shortcut="N">
+            ✦ New Character
+          </button>
+          <button id="btn-open-faction-builder" class="toolbar-btn toolbar-btn-faction" data-shortcut="Shift+N">
+            🏰 New Faction
+          </button>
+          <button id="btn-edit-general-config" class="toolbar-btn toolbar-btn-config-edit" data-shortcut="G">
+            ⚙ Edit Config
+          </button>
+        </div>
+
+        <!-- Second line: Utilities -->
+        <div class="toolbar-row">
+          <button id="btn-import-npcs" class="toolbar-btn toolbar-btn-import">
+            📁 Import NPCs
+          </button>
+          <button id="btn-import-factions" class="toolbar-btn toolbar-btn-import-factions">
+            🏰 Import Factions
+          </button>
+          <button id="btn-import-general-config" class="toolbar-btn toolbar-btn-config">
+            ⚙ Import Config
+          </button>
+          <button id="btn-export-npcs" class="toolbar-btn toolbar-btn-export" title="Export all custom NPCs">
+            ↓ Export
+          </button>
+          <button id="btn-undo" class="toolbar-btn toolbar-btn-undo" data-shortcut="U" disabled>
+            ↶ Undo
+          </button>
+          <button id="btn-dev-toggle" class="toolbar-btn toolbar-btn-dev" data-shortcut="D">
+            🔧 Dev
+          </button>
+          <button id="btn-theme-toggle" class="toolbar-btn toolbar-btn-theme" data-shortcut="T">
+            ☾ Dark
+          </button>
+          <button id="btn-reset" class="btn-reset dev-only hidden" title="Reset all data">↺ Reset</button>
+        </div>
       </div>
     </div>
   </header>
@@ -55,7 +74,7 @@
           id="npc-search" 
           type="text" 
           class="npc-search-input" 
-          placeholder="Search by name…" 
+          placeholder="Search by name…"
           autocomplete="off"
         />
         <select id="npc-faction-filter" class="npc-faction-filter">
@@ -66,6 +85,7 @@
           <span>Include Dead</span>
         </label>
       </div>
+      <div id="npc-pagination" class="npc-pagination"></div>
       <div id="npc-list" class="npc-list"></div>
     </section>
 
@@ -74,6 +94,11 @@
       <section class="panel panel-factions" aria-label="Faction Reputation">
         <h2 class="panel-title"><span class="panel-icon">🏰</span> Faction Standing</h2>
         <div id="reputation-list" class="reputation-list"></div>
+      </section>
+
+      <section class="panel panel-perf hidden" aria-label="Performance Telemetry">
+        <h2 class="panel-title"><span class="panel-icon">📈</span> Performance</h2>
+        <div id="perf-metrics" class="perf-metrics"></div>
       </section>
     </aside>
   </main>

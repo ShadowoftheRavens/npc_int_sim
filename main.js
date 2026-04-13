@@ -1,8 +1,8 @@
 // main.js — App entry point (Phase 1 + 2 + 3)
 
-import { initialData }                      from "./data.js";
-import { loadState, saveState, clearState } from "./storage.js";
-import { render }                           from "./ui.js";
+import { initialData }                                         from "./data.js";
+import { loadState, saveState, clearState, flushStorageWrites, getPendingStorageWriteCount } from "./storage.js";
+import { render }                                                from "./ui.js";
 import {
   isFileSystemSupported,
   hasFileAccess,
@@ -17,7 +17,9 @@ import {
   persistNPCSnapshot,
   removePersistedNPC,
   exportNpcAndFactionFiles,
-  getFolderName
+  getFolderName,
+  getPendingIOCount,
+  flushFileIOQueue
 } from "./fileSystem.js";
 import {
   initCharacterBuilder,
@@ -31,12 +33,187 @@ import {
   openFactionEditModal,
   updateFactionBuilderState
 } from "./factionBuilder.js";
+import {
+  initGeneralConfigBuilder,
+  openGeneralConfigModal,
+  updateGeneralConfigBuilderState
+} from "./generalConfigBuilder.js";
+import {
+  initNotesBuilder,
+  openNotesModal,
+  updateNotesBuilderState
+} from "./notesBuilder.js";
 
 const THEME_KEY = "npc_theme_mode";
+const DEV_MODE_KEY = "npc_dev_mode";
+const MAX_UNDO_DEPTH = 40;
+let _undoStack = [];
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
+
+function sanitizeSnapshotState(state) {
+  const snapshot = deepClone(state);
+  delete snapshot._npcById;
+  delete snapshot._factionById;
+  delete snapshot._customNpcIdSet;
+  return snapshot;
+}
+
+function updateUndoButtonState() {
+  const undoBtn = document.getElementById("btn-undo");
+  if (!undoBtn) return;
+  undoBtn.disabled = _undoStack.length === 0;
+}
+
+function pushUndoSnapshot(state) {
+  if (!state) return;
+  _undoStack.push(sanitizeSnapshotState(state));
+  if (_undoStack.length > MAX_UNDO_DEPTH) {
+    _undoStack = _undoStack.slice(-MAX_UNDO_DEPTH);
+  }
+  updateUndoButtonState();
+}
+
+async function undoLastAction() {
+  if (_undoStack.length === 0) {
+    showToast("Nothing to undo", "warn");
+    updateUndoButtonState();
+    return;
+  }
+
+  const restored = _undoStack.pop();
+  updateUndoButtonState();
+  if (!restored) return;
+
+  restored.system = normalizeSystemConfig(restored.system);
+  if (!Array.isArray(restored.customNPCs)) restored.customNPCs = [];
+  if (!Array.isArray(restored.deletedBuiltinNPCIds)) restored.deletedBuiltinNPCIds = [];
+
+  mergeCustomNPCs(restored);
+  syncReadinessFromState(restored);
+  syncFactionsFromNPCs(restored);
+  rebuildStateIndexes(restored);
+
+  saveState(restored);
+  await window.__persistFactions?.();
+  await window.__persistNPCSnapshot?.();
+
+  window.__appState = restored;
+  updateBuilderState(restored);
+  updateFactionBuilderState(restored);
+  updateGeneralConfigBuilderState(restored);
+  updateNotesBuilderState(restored);
+  render(restored);
+  showToast("Undid last action", "ok");
+}
+
+function rebuildStateIndexes(state) {
+  state._npcById = new Map();
+  for (const npc of (state.npcs ?? [])) {
+    state._npcById.set(npc.id, npc);
+  }
+
+  state._factionById = new Map();
+  for (const faction of (state.factions ?? [])) {
+    state._factionById.set(faction.id, faction);
+  }
+
+  state._customNpcIdSet = new Set((state.customNPCs ?? []).map(n => n.id));
+
+  const devLike = location.protocol === "file:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+  if (devLike) {
+    const npcCount = Array.isArray(state.npcs) ? state.npcs.length : 0;
+    const factionCount = Array.isArray(state.factions) ? state.factions.length : 0;
+
+    if (state._npcById.size !== npcCount) {
+      console.warn("[state] NPC index mismatch", { index: state._npcById.size, source: npcCount });
+    }
+    if (state._factionById.size !== factionCount) {
+      console.warn("[state] Faction index mismatch", { index: state._factionById.size, source: factionCount });
+    }
+  }
+}
+
+function cloneDefaultSystemConfig() {
+  const base = initialData.system ?? { stats: [], actions: [] };
+  return {
+    stats: Array.isArray(base.stats) ? [...base.stats] : [],
+    actions: Array.isArray(base.actions)
+      ? base.actions.map(action => ({
+          ...action,
+          effects: { ...(action?.effects ?? {}) },
+          ranges: { ...(action?.ranges ?? {}) }
+        }))
+      : []
+  };
+}
+
+function normalizeSystemConfig(systemInput) {
+  const defaults = cloneDefaultSystemConfig();
+  const source = systemInput && typeof systemInput === "object" ? systemInput : {};
+
+  const stats = Array.isArray(source.stats) && source.stats.length > 0
+    ? [...source.stats]
+    : [...(defaults.stats ?? [])];
+
+  const defaultActionsById = new Map((defaults.actions ?? []).map(action => [action.id, action]));
+  const sourceActions = Array.isArray(source.actions) && source.actions.length > 0
+    ? source.actions
+    : (defaults.actions ?? []);
+
+  const actions = sourceActions
+    .filter(action => action && typeof action.id === "string")
+    .map(action => {
+      const fallback = defaultActionsById.get(action.id) ?? null;
+      const effectSource = (action.effects && typeof action.effects === "object")
+        ? action.effects
+        : (fallback?.effects ?? {});
+
+      const effects = {};
+      for (const [stat, value] of Object.entries(effectSource)) {
+        const n = Number(value);
+        effects[stat] = Number.isFinite(n) ? Math.round(n) : 0;
+      }
+
+      const rangeSource = (action.ranges && typeof action.ranges === "object")
+        ? action.ranges
+        : (fallback?.ranges ?? {});
+
+      const ranges = {};
+      // Loop through ALL stats, not just effects keys
+      for (const stat of stats) {
+        const base = effects[stat] ?? 0;
+        const raw = rangeSource?.[stat];
+        let min = Number(raw?.min);
+        let max = Number(raw?.max);
+
+        if (!Number.isFinite(min) || !Number.isFinite(max)) {
+          min = base;
+          max = base;
+        }
+
+        min = Math.round(min);
+        max = Math.round(max);
+        if (min > max) [min, max] = [max, min];
+        ranges[stat] = {
+          min,
+          max,
+          enabled: raw?.enabled !== false
+        };
+      }
+
+      return {
+        id: action.id,
+        label: String(action.label ?? fallback?.label ?? action.id),
+        effects,
+        ranges
+      };
+    });
+
+  return { stats, actions };
+}
 
 function applyTheme(mode) {
   const safeMode = mode === "light" ? "light" : "dark";
@@ -48,6 +225,8 @@ function applyTheme(mode) {
   const btn = document.getElementById("btn-theme-toggle");
   if (btn) {
     btn.textContent = safeMode === "light" ? "☀ Light" : "☾ Dark";
+    btn.setAttribute("aria-pressed", safeMode === "dark" ? "true" : "false");
+    btn.setAttribute("aria-label", safeMode === "light" ? "Switch to dark theme" : "Switch to light theme");
   }
 }
 
@@ -57,6 +236,89 @@ function loadTheme() {
     saved = localStorage.getItem(THEME_KEY);
   } catch (_) {}
   applyTheme(saved === "light" ? "light" : "dark");
+}
+
+function applyDevMode(enabled) {
+  window.__devMode = Boolean(enabled);
+  try {
+    localStorage.setItem(DEV_MODE_KEY, enabled ? "1" : "0");
+  } catch (_) {}
+
+  const btn = document.getElementById("btn-dev-toggle");
+  if (btn) {
+    btn.classList.toggle("active", enabled);
+    btn.setAttribute("aria-pressed", enabled ? "true" : "false");
+    btn.setAttribute("aria-label", enabled ? "Disable developer mode" : "Enable developer mode");
+  }
+
+  const perfPanel = document.querySelector(".panel-perf");
+  if (perfPanel) {
+    perfPanel.classList.toggle("hidden", !enabled);
+  }
+
+  const devOnlyElements = document.querySelectorAll(".dev-only");
+  devOnlyElements.forEach(el => {
+    el.classList.toggle("hidden", !enabled);
+  });
+}
+
+function isTypingTarget(target) {
+  if (!(target instanceof Element)) return false;
+  const tag = target.tagName;
+  return target.isContentEditable || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+function wireKeyboardShortcuts() {
+  document.addEventListener("keydown", evt => {
+    if (evt.defaultPrevented || isTypingTarget(evt.target)) return;
+    if (evt.ctrlKey || evt.metaKey || evt.altKey) return;
+
+    if (evt.key === "/") {
+      evt.preventDefault();
+      document.getElementById("npc-search")?.focus();
+      return;
+    }
+
+    const key = String(evt.key || "").toLowerCase();
+    if (key === "n" && evt.shiftKey) {
+      evt.preventDefault();
+      openFactionCreateModal();
+      return;
+    }
+    if (key === "n") {
+      evt.preventDefault();
+      openCreateModal();
+      return;
+    }
+    if (key === "g") {
+      evt.preventDefault();
+      openGeneralConfigModal();
+      return;
+    }
+    if (key === "d") {
+      evt.preventDefault();
+      applyDevMode(!window.__devMode);
+      return;
+    }
+    if (key === "t") {
+      evt.preventDefault();
+      const current = document.body.dataset.theme === "light" ? "light" : "dark";
+      applyTheme(current === "light" ? "dark" : "light");
+      return;
+    }
+    if (key === "u") {
+      evt.preventDefault();
+      void undoLastAction();
+    }
+  });
+}
+
+function loadDevMode() {
+  let saved = null;
+  try {
+    saved = localStorage.getItem(DEV_MODE_KEY);
+  } catch (_) {}
+  applyDevMode(saved === "1");
 }
 
 function titleFromFactionId(id) {
@@ -144,14 +406,16 @@ function syncFactionsFromNPCs(state) {
   if (!Array.isArray(state.factions)) state.factions = [];
   if (!state.player?.reputation) state.player.reputation = {};
 
+  const knownFactionIds = new Set((state.factions ?? []).map(f => f.id));
+
   for (const npc of (state.npcs ?? [])) {
     const factionId = npc?.factionId;
     if (!factionId) continue;
 
-    const existing = state.factions.find(f => f.id === factionId);
-    if (!existing) {
+    if (!knownFactionIds.has(factionId)) {
       const inferredName = String(npc.factionName ?? "").trim() || titleFromFactionId(factionId);
       state.factions.push({ id: factionId, name: inferredName, reputation: 50, affiliatedFactions: [], hatedFactions: [] });
+      knownFactionIds.add(factionId);
     }
 
     if (!(factionId in state.player.reputation)) {
@@ -209,6 +473,7 @@ async function handleNPCSave(npc, isEdit) {
   syncTrustRespectCaps(state);
   syncReadinessFromState(state);
   syncFactionsFromNPCs(state);
+  rebuildStateIndexes(state);
   saveState(state);
   await persistFactions(state.factions);
   await persistNPC(normalizedNPC, state.customNPCs);
@@ -235,6 +500,7 @@ async function handleNPCDelete(npcId) {
   mergeCustomNPCs(state);
   syncReadinessFromState(state);
   syncFactionsFromNPCs(state);
+  rebuildStateIndexes(state);
   saveState(state);
   if (!builtinIds.has(npcId)) {
     await removePersistedNPC(npcId, state.customNPCs);
@@ -320,8 +586,18 @@ async function handleFactionSave(factionInput, isEdit) {
   }
   state.player.reputation[baseFaction.id] = baseFaction.reputation;
 
+  rebuildStateIndexes(state);
   saveState(state);
   await persistFactions(state.factions);
+  render(state);
+}
+
+async function handleGeneralConfigSave(systemConfig) {
+  const state = window.__appState;
+  state.system = normalizeSystemConfig(systemConfig);
+  rebuildStateIndexes(state);
+  saveState(state);
+  updateGeneralConfigBuilderState(state);
   render(state);
 }
 
@@ -352,12 +628,17 @@ async function handleImportNPCs() {
     mergeCustomNPCs(state);
     syncReadinessFromState(state);
     syncFactionsFromNPCs(state);
+    rebuildStateIndexes(state);
     saveState(state);
     saveToLocalStorage(state.customNPCs);
     await persistNPCSnapshot(state.npcs ?? []);
     render(state);
     updateImportButtonsLabel();
-    showToast(`Imported ${newNPCs.length} NPC character(s)`, "ok");
+    if (newNPCs.length === 0) {
+      showToast("No new NPC files found in linked folder", "warn");
+    } else {
+      showToast(`Imported ${newNPCs.length} NPC character(s)`, "ok");
+    }
   } else {
     showToast("Select one or more NPC .json files", "info");
     triggerFileInputFallback(state, "npcs");
@@ -381,15 +662,89 @@ async function handleImportFactions() {
       if (!(faction.id in state.player.reputation)) state.player.reputation[faction.id] = 20;
     }
     syncFactionsFromNPCs(state);
+    rebuildStateIndexes(state);
     saveState(state);
     await persistFactions(state.factions);
     render(state);
     updateImportButtonsLabel();
-    showToast(`Imported ${freshFactions.length} faction(s)`, "ok");
+    if (freshFactions.length === 0) {
+      showToast("No new faction files found in linked folder", "warn");
+    } else {
+      showToast(`Imported ${freshFactions.length} faction(s)`, "ok");
+    }
   } else {
     showToast("Select one or more faction .json files", "info");
     triggerFileInputFallback(state, "factions");
   }
+}
+
+function extractSystemConfig(payload) {
+  if (!payload || typeof payload !== "object") return null;
+
+  if (payload.format === "general_config_v1" && payload.system) {
+    return payload.system;
+  }
+
+  if (Array.isArray(payload.actions)) {
+    return { stats: payload.stats ?? initialData.system.stats, actions: payload.actions };
+  }
+
+  if (payload.system && Array.isArray(payload.system.actions)) {
+    return payload.system;
+  }
+
+  if (
+    payload.format === "npc_simulator_state_v1" &&
+    payload.state?.system &&
+    Array.isArray(payload.state.system.actions)
+  ) {
+    return payload.state.system;
+  }
+
+  return null;
+}
+
+async function handleImportGeneralConfig() {
+  showToast("Select a general config JSON file", "info");
+
+  const state = window.__appState;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json,application/json";
+  input.multiple = false;
+  input.style.display = "none";
+
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    if (!file) {
+      input.remove();
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const parsedSystem = extractSystemConfig(payload);
+      if (!parsedSystem) {
+        showToast("No valid general config found in selected file", "err");
+        input.remove();
+        return;
+      }
+
+      state.system = normalizeSystemConfig(parsedSystem);
+      saveState(state);
+      updateGeneralConfigBuilderState(state);
+      render(state);
+      showToast("General config imported", "ok");
+    } catch (e) {
+      showToast("Failed to import config: " + (e?.message ?? String(e)), "err");
+    }
+
+    input.remove();
+  });
+
+  document.body.appendChild(input);
+  input.click();
 }
 
 // ── <input type="file"> fallback (works on file:// and all browsers) ──────────
@@ -464,10 +819,12 @@ function triggerFileInputFallback(state, kind) {
     if (importedSnapshotState) {
       const next = importedSnapshotState;
       if (!Array.isArray(next.customNPCs)) next.customNPCs = [];
+      next.system = normalizeSystemConfig(next.system);
 
       mergeCustomNPCs(next);
       syncReadinessFromState(next);
       syncFactionsFromNPCs(next);
+      rebuildStateIndexes(next);
       saveState(next);
       saveToLocalStorage(next.customNPCs);
       await persistFactions(next.factions ?? []);
@@ -475,6 +832,7 @@ function triggerFileInputFallback(state, kind) {
       window.__appState = next;
       updateBuilderState(next);
       updateFactionBuilderState(next);
+      updateGeneralConfigBuilderState(next);
       render(next);
 
       showToast("Imported full session state", "ok");
@@ -490,6 +848,7 @@ function triggerFileInputFallback(state, kind) {
       mergeCustomNPCs(state);
       syncReadinessFromState(state);
       syncFactionsFromNPCs(state);
+      rebuildStateIndexes(state);
       saveState(state);
       saveToLocalStorage(state.customNPCs);
       await persistNPCSnapshot(state.npcs ?? []);
@@ -507,6 +866,7 @@ function triggerFileInputFallback(state, kind) {
         if (!(faction.id in state.player.reputation)) state.player.reputation[faction.id] = 20;
       }
       syncFactionsFromNPCs(state);
+      rebuildStateIndexes(state);
       saveState(state);
       await persistFactions(state.factions);
       render(state);
@@ -530,17 +890,10 @@ function triggerFileInputFallback(state, kind) {
 function updateImportButtonsLabel() {
   const npcsBtn = document.getElementById("btn-import-npcs");
   const factionsBtn = document.getElementById("btn-import-factions");
-  const folderName = getFolderName();
 
   for (const btn of [npcsBtn, factionsBtn]) {
     if (!btn) continue;
-    if (hasFileAccess()) {
-      btn.title = `Folder linked: ${folderName ?? "linked"}`;
-    } else if (isFileSystemSupported()) {
-      btn.title = "Pick a folder to load/save files";
-    } else {
-      btn.title = "Select JSON files to import (running from file://)";
-    }
+    delete btn.dataset.tooltip;
   }
 }
 
@@ -554,12 +907,17 @@ function showToast(msg, type = "info") {
     toast = document.createElement("div");
     toast.id = "app-toast";
     toast.className = "app-toast";
+    toast.setAttribute("aria-live", "polite");
+    toast.setAttribute("role", "status");
     document.body.appendChild(toast);
   }
 
+  const safeType = ["ok", "err", "warn", "info"].includes(type) ? type : "info";
   clearTimeout(_toastTimer);
   toast.textContent = msg;
-  toast.className = `app-toast app-toast-${type} app-toast-show`;
+  toast.className = `app-toast app-toast-${safeType} app-toast-show`;
+  toast.setAttribute("aria-live", safeType === "err" ? "assertive" : "polite");
+  toast.setAttribute("role", safeType === "err" ? "alert" : "status");
 
   _toastTimer = setTimeout(() => {
     toast.classList.remove("app-toast-show");
@@ -579,8 +937,22 @@ function wireToolbar(state) {
     importFactionBtn.addEventListener("click", handleImportFactions);
   }
 
+  const importConfigBtn = document.getElementById("btn-import-general-config");
+  if (importConfigBtn) {
+    importConfigBtn.addEventListener("click", handleImportGeneralConfig);
+  }
+
+  const editConfigBtn = document.getElementById("btn-edit-general-config");
+  if (editConfigBtn) {
+    editConfigBtn.setAttribute("aria-keyshortcuts", "G");
+    editConfigBtn.addEventListener("click", () => {
+      openGeneralConfigModal();
+    });
+  }
+
   const builderBtn = document.getElementById("btn-open-builder");
   if (builderBtn) {
+    builderBtn.setAttribute("aria-keyshortcuts", "N");
     builderBtn.addEventListener("click", () => {
       openCreateModal();
     });
@@ -588,6 +960,7 @@ function wireToolbar(state) {
 
   const factionBuilderBtn = document.getElementById("btn-open-faction-builder");
   if (factionBuilderBtn) {
+    factionBuilderBtn.setAttribute("aria-keyshortcuts", "Shift+N");
     factionBuilderBtn.addEventListener("click", () => {
       openFactionCreateModal();
     });
@@ -596,16 +969,37 @@ function wireToolbar(state) {
   const exportBtn = document.getElementById("btn-export-npcs");
   if (exportBtn) {
     exportBtn.addEventListener("click", () => {
-      exportNpcAndFactionFiles(state);
-      showToast(`Exported NPC and faction files (${(state.npcs ?? []).length} NPCs, ${(state.factions ?? []).length} factions)`, "ok");
+      try {
+        exportNpcAndFactionFiles(state);
+        showToast(`Exported NPC and faction files (${(state.npcs ?? []).length} NPCs, ${(state.factions ?? []).length} factions)`, "ok");
+      } catch (e) {
+        showToast("Export failed: " + (e?.message ?? String(e)), "err");
+      }
     });
   }
 
   const themeBtn = document.getElementById("btn-theme-toggle");
   if (themeBtn) {
+    themeBtn.setAttribute("aria-keyshortcuts", "T");
     themeBtn.addEventListener("click", () => {
       const current = document.body.dataset.theme === "light" ? "light" : "dark";
       applyTheme(current === "light" ? "dark" : "light");
+    });
+  }
+
+  const devBtn = document.getElementById("btn-dev-toggle");
+  if (devBtn) {
+    devBtn.setAttribute("aria-keyshortcuts", "D");
+    devBtn.addEventListener("click", () => {
+      applyDevMode(!window.__devMode);
+    });
+  }
+
+  const undoBtn = document.getElementById("btn-undo");
+  if (undoBtn) {
+    undoBtn.setAttribute("aria-keyshortcuts", "U");
+    undoBtn.addEventListener("click", () => {
+      void undoLastAction();
     });
   }
 
@@ -614,17 +1008,31 @@ function wireToolbar(state) {
     resetBtn.addEventListener("click", async () => {
       if (!confirm("Reset ALL data (built-in NPCs + custom characters) to defaults?")) return;
       clearState();
+      _undoStack = [];
+      updateUndoButtonState();
       localStorage.removeItem("custom_npcs");
       localStorage.removeItem("custom_npcs_folder_name");
       localStorage.removeItem("custom_factions");
       const fresh = deepClone(initialData);
       fresh.customNPCs = [];
       fresh.deletedBuiltinNPCIds = [];
+      
+      // Clear all notes from NPCs on reset
+      for (const npc of fresh.npcs) {
+        npc.notes = "";
+      }
+      for (const npc of fresh.customNPCs) {
+        npc.notes = "";
+      }
+      
       saveState(fresh);
       await persistFactions(fresh.factions ?? []);
+      rebuildStateIndexes(fresh);
       window.__appState = fresh;
       updateBuilderState(fresh);
       updateFactionBuilderState(fresh);
+      updateGeneralConfigBuilderState(fresh);
+      updateNotesBuilderState(fresh);
       render(fresh);
       updateImportButtonsLabel();
       showToast("Data reset to defaults", "ok");
@@ -636,12 +1044,12 @@ function wireToolbar(state) {
 
 async function init() {
   loadTheme();
+  loadDevMode();
 
   // 1. Load or create state
   let state = loadState();
   if (!state) state = deepClone(initialData);
-  // Keep core system config up to date for existing saved states.
-  state.system = deepClone(initialData.system);
+  state.system = normalizeSystemConfig(state.system);
   if (!Array.isArray(state.customNPCs)) state.customNPCs = [];
   if (!Array.isArray(state.deletedBuiltinNPCIds)) state.deletedBuiltinNPCIds = [];
 
@@ -667,6 +1075,7 @@ async function init() {
   mergeCustomNPCs(state);
   syncReadinessFromState(state);
   syncFactionsFromNPCs(state);
+  rebuildStateIndexes(state);
   saveState(state);
 
   // 4. Expose globally
@@ -674,11 +1083,18 @@ async function init() {
 
   // 5. Expose edit/delete helpers so ui.js card buttons can reach them
   window.__openEditModal   = (npc) => openEditModal(npc);
+  window.__openNotesModal  = (npcId) => openNotesModal(npcId);
   window.__handleNPCDelete = (id)  => handleNPCDelete(id);
   window.__persistNPCSnapshot = async () => persistNPCSnapshot(window.__appState?.npcs ?? []);
   window.__persistFactions = async () => persistFactions(window.__appState?.factions ?? []);
   window.__openFactionCreateModal = () => openFactionCreateModal();
   window.__openFactionEditModal = (faction) => openFactionEditModal(faction);
+  window.__pushUndoSnapshot = (snapshotState) => pushUndoSnapshot(snapshotState);
+  window.__getFileQueueLength = () => Number(getPendingIOCount?.() ?? 0);
+  window.__getStorageQueueLength = () => Number(getPendingStorageWriteCount?.() ?? 0);
+  window.__getPersistenceQueueLength = () => {
+    return window.__getFileQueueLength() + window.__getStorageQueueLength();
+  };
 
   // 6. Init character builder (attaches modal to DOM)
   initCharacterBuilder(state, {
@@ -690,9 +1106,21 @@ async function init() {
     onSave: handleFactionSave
   });
 
+  initGeneralConfigBuilder(state, {
+    onSave: handleGeneralConfigSave
+  });
+
+  initNotesBuilder(state, async (updatedState) => {
+    saveState(updatedState);
+    await window.__persistNPCSnapshot?.();
+    render(updatedState);
+  });
+
   // 7. Render and wire UI
   render(state);
   wireToolbar(state);
+  wireKeyboardShortcuts();
+  updateUndoButtonState();
   updateImportButtonsLabel();
 
   // 8. Show a hint if running from file:// about FS API limitation
@@ -702,6 +1130,14 @@ async function init() {
       "Import uses <input type='file'> fallback. To enable folder sync, serve via: npx serve ."
     );
   }
+
+  // 9. Ensure queued persistence drains on tab close/navigation.
+  window.addEventListener("beforeunload", async () => {
+    await Promise.all([
+      flushStorageWrites(),
+      flushFileIOQueue()
+    ]);
+  });
 }
 
 if (document.readyState === "loading") {

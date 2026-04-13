@@ -11,6 +11,32 @@ let _dirHandle   = null;
 let _charsHandle = null;
 let _factionsHandle = null;
 
+let _fileIOQueue = Promise.resolve();
+let _pendingFileIO = 0;
+
+function enqueueFileIO(task) {
+  _pendingFileIO += 1;
+
+  const run = async () => {
+    try {
+      return await task();
+    } finally {
+      _pendingFileIO = Math.max(0, _pendingFileIO - 1);
+    }
+  };
+
+  _fileIOQueue = _fileIOQueue.then(run, run);
+  return _fileIOQueue;
+}
+
+export function getPendingIOCount() {
+  return _pendingFileIO;
+}
+
+export async function flushFileIOQueue() {
+  await _fileIOQueue;
+}
+
 function loadJsonFromLocalStorage(key) {
   try {
     const raw = localStorage.getItem(key);
@@ -31,29 +57,33 @@ function saveJsonToLocalStorage(key, value) {
 }
 
 async function loadJsonFromFile(fileName, collectionKey = null) {
-  if (!_dirHandle) return [];
-  try {
-    const fh = await _dirHandle.getFileHandle(fileName, { create: false });
-    const file = await fh.getFile();
-    const parsed = JSON.parse(await file.text());
-    if (collectionKey && parsed && Array.isArray(parsed[collectionKey])) return parsed[collectionKey];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
-  }
+  return enqueueFileIO(async () => {
+    if (!_dirHandle) return [];
+    try {
+      const fh = await _dirHandle.getFileHandle(fileName, { create: false });
+      const file = await fh.getFile();
+      const parsed = JSON.parse(await file.text());
+      if (collectionKey && parsed && Array.isArray(parsed[collectionKey])) return parsed[collectionKey];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  });
 }
 
 async function persistJsonToFile(fileName, value, collectionKey = null) {
-  if (!_dirHandle) return;
-  try {
-    const fh = await _dirHandle.getFileHandle(fileName, { create: true });
-    const writable = await fh.createWritable();
-    const payload = collectionKey ? { [collectionKey]: Array.isArray(value) ? value : [] } : value;
-    await writable.write(JSON.stringify(payload, null, 2));
-    await writable.close();
-  } catch (e) {
-    console.warn(`[fileSystem] persistJsonToFile(${fileName}):`, e);
-  }
+  return enqueueFileIO(async () => {
+    if (!_dirHandle) return;
+    try {
+      const fh = await _dirHandle.getFileHandle(fileName, { create: true });
+      const writable = await fh.createWritable();
+      const payload = collectionKey ? { [collectionKey]: Array.isArray(value) ? value : [] } : value;
+      await writable.write(JSON.stringify(payload, null, 2));
+      await writable.close();
+    } catch (e) {
+      console.warn(`[fileSystem] persistJsonToFile(${fileName}):`, e);
+    }
+  });
 }
 
 // ── Feature detection ─────────────────────────────────────────────────────────
@@ -100,97 +130,109 @@ export async function initFileSystem() {
 // ── Load from folder ──────────────────────────────────────────────────────────
 
 export async function loadCharactersFromFolder() {
-  if (!_charsHandle) return [];
-  const npcs = [];
-  try {
-    for await (const [name, handle] of _charsHandle.entries()) {
-      if (handle.kind === "file" && name.endsWith(".json")) {
-        try {
-          const file = await handle.getFile();
-          const npc  = JSON.parse(await file.text());
-          if (npc && npc.id) npcs.push(npc);
-        } catch (e) {
-          console.warn(`[fileSystem] Skipping bad file ${name}:`, e);
+  return enqueueFileIO(async () => {
+    if (!_charsHandle) return [];
+    const npcs = [];
+    try {
+      for await (const [name, handle] of _charsHandle.entries()) {
+        if (handle.kind === "file" && name.endsWith(".json")) {
+          try {
+            const file = await handle.getFile();
+            const npc  = JSON.parse(await file.text());
+            if (npc && npc.id) npcs.push(npc);
+          } catch (e) {
+            console.warn(`[fileSystem] Skipping bad file ${name}:`, e);
+          }
         }
       }
+    } catch (e) {
+      console.warn("[fileSystem] loadCharactersFromFolder:", e);
     }
-  } catch (e) {
-    console.warn("[fileSystem] loadCharactersFromFolder:", e);
-  }
-  return npcs;
+    return npcs;
+  });
 }
 
 export async function loadFactionsFromFolder() {
-  if (!_factionsHandle) return [];
-  const factions = [];
-  try {
-    for await (const [name, handle] of _factionsHandle.entries()) {
-      if (handle.kind === "file" && name.endsWith(".json")) {
-        try {
-          const file = await handle.getFile();
-          const faction = JSON.parse(await file.text());
-          if (faction && faction.id) factions.push(faction);
-        } catch (e) {
-          console.warn(`[fileSystem] Skipping bad faction file ${name}:`, e);
+  return enqueueFileIO(async () => {
+    if (!_factionsHandle) return [];
+    const factions = [];
+    try {
+      for await (const [name, handle] of _factionsHandle.entries()) {
+        if (handle.kind === "file" && name.endsWith(".json")) {
+          try {
+            const file = await handle.getFile();
+            const faction = JSON.parse(await file.text());
+            if (faction && faction.id) factions.push(faction);
+          } catch (e) {
+            console.warn(`[fileSystem] Skipping bad faction file ${name}:`, e);
+          }
         }
       }
+    } catch (e) {
+      console.warn("[fileSystem] loadFactionsFromFolder:", e);
     }
-  } catch (e) {
-    console.warn("[fileSystem] loadFactionsFromFolder:", e);
-  }
-  return factions;
+    return factions;
+  });
 }
 
 // ── Save to file ──────────────────────────────────────────────────────────────
 
 export async function saveCharacterToFile(npc) {
-  if (!_charsHandle) return false;
-  try {
-    const fh  = await _charsHandle.getFileHandle(`${npc.id}.json`, { create: true });
-    const writable = await fh.createWritable();
-    await writable.write(JSON.stringify(npc, null, 2));
-    await writable.close();
-    return true;
-  } catch (e) {
-    console.warn("[fileSystem] saveCharacterToFile:", e);
-    return false;
-  }
+  return enqueueFileIO(async () => {
+    if (!_charsHandle) return false;
+    try {
+      const fh  = await _charsHandle.getFileHandle(`${npc.id}.json`, { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(JSON.stringify(npc, null, 2));
+      await writable.close();
+      return true;
+    } catch (e) {
+      console.warn("[fileSystem] saveCharacterToFile:", e);
+      return false;
+    }
+  });
 }
 
 // ── Delete from file ──────────────────────────────────────────────────────────
 
 export async function deleteCharacterFile(npcId) {
-  if (!_charsHandle) return false;
-  try {
-    await _charsHandle.removeEntry(`${npcId}.json`);
-    return true;
-  } catch (_) {
-    return false;
-  }
+  return enqueueFileIO(async () => {
+    if (!_charsHandle) return false;
+    try {
+      await _charsHandle.removeEntry(`${npcId}.json`);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  });
 }
 
 export async function saveFactionToFile(faction) {
-  if (!_factionsHandle) return false;
-  try {
-    const fh = await _factionsHandle.getFileHandle(`${faction.id}.json`, { create: true });
-    const writable = await fh.createWritable();
-    await writable.write(JSON.stringify(faction, null, 2));
-    await writable.close();
-    return true;
-  } catch (e) {
-    console.warn("[fileSystem] saveFactionToFile:", e);
-    return false;
-  }
+  return enqueueFileIO(async () => {
+    if (!_factionsHandle) return false;
+    try {
+      const fh = await _factionsHandle.getFileHandle(`${faction.id}.json`, { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(JSON.stringify(faction, null, 2));
+      await writable.close();
+      return true;
+    } catch (e) {
+      console.warn("[fileSystem] saveFactionToFile:", e);
+      return false;
+    }
+  });
 }
 
 export async function deleteFactionFile(factionId) {
-  if (!_factionsHandle) return false;
-  try {
-    await _factionsHandle.removeEntry(`${factionId}.json`);
-    return true;
-  } catch (_) {
-    return false;
-  }
+  return enqueueFileIO(async () => {
+    if (!_factionsHandle) return false;
+    try {
+      await _factionsHandle.removeEntry(`${factionId}.json`);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  });
 }
 
 // ── localStorage fallback ─────────────────────────────────────────────────────
@@ -225,11 +267,13 @@ export async function persistFactions(factions) {
       await saveFactionToFile(faction);
     }
     try {
-      for await (const [name, handle] of _factionsHandle.entries()) {
-        if (handle.kind === "file" && name.endsWith(".json") && !keep.has(name)) {
-          await _factionsHandle.removeEntry(name);
+      await enqueueFileIO(async () => {
+        for await (const [name, handle] of _factionsHandle.entries()) {
+          if (handle.kind === "file" && name.endsWith(".json") && !keep.has(name)) {
+            await _factionsHandle.removeEntry(name);
+          }
         }
-      }
+      });
     } catch (e) {
       console.warn("[fileSystem] persistFactions cleanup:", e);
     }

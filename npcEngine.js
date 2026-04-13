@@ -16,6 +16,21 @@ function randomFactor(min = 0.9, max = 1.1) {
   return min + Math.random() * (max - min);
 }
 
+function rollBaseDelta(action, stat, fallbackDelta = 0) {
+  const range = action?.ranges?.[stat];
+  if (!range || !Number.isFinite(Number(range.min)) || !Number.isFinite(Number(range.max))) {
+    return Math.round(Number(fallbackDelta) || 0);
+  }
+
+  let min = Math.round(Number(range.min));
+  let max = Math.round(Number(range.max));
+  if (min > max) [min, max] = [max, min];
+  if (min === max) return min;
+
+  // Inclusive integer roll so both boundaries can be selected directly.
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
 function fearCapForNPC(npc) {
   const brave = normalizeTrait(npc?.personality?.brave);
   // brave=0 -> cap 100, brave=100 -> cap 25
@@ -53,7 +68,40 @@ function readinessForNPC(npc) {
   return clamp(Math.round(score));
 }
 
-function adjustedDelta(npc, actionId, stat, baseDelta) {
+function signOf(n) {
+  if (n > 0) return 1;
+  if (n < 0) return -1;
+  return 0;
+}
+
+function getLastNonZeroStatSign(memory, stat) {
+  if (!Array.isArray(memory) || !memory.length) return 0;
+
+  for (let i = memory.length - 1; i >= 0; i -= 1) {
+    const delta = Number(memory[i]?.statDeltas?.[stat] ?? 0);
+    const s = signOf(delta);
+    if (s !== 0) return s;
+  }
+
+  return 0;
+}
+
+function getConsecutiveStatDirectionCount(memory, stat, directionSign) {
+  if (!Array.isArray(memory) || !memory.length || !directionSign) return 0;
+
+  let count = 0;
+  for (let i = memory.length - 1; i >= 0; i -= 1) {
+    const delta = Number(memory[i]?.statDeltas?.[stat] ?? 0);
+    const s = signOf(delta);
+    if (s === 0) continue;
+    if (s !== directionSign) break;
+    count += 1;
+  }
+
+  return count;
+}
+
+function adjustedDelta(npc, actionId, stat, baseDelta, repeatCount = 0, isFirstReversalHit = false) {
   const personality = npc.personality ?? {};
   const traits = npc.traits ?? [];
 
@@ -99,9 +147,21 @@ function adjustedDelta(npc, actionId, stat, baseDelta) {
     if (traits.includes("coward")) multiplier += 0.2;
   }
 
+  // Repeating the same action builds consistency with this NPC, so impact
+  // scales up over time while becoming less random.
+  const streakBonus = Math.min(0.6, Math.max(0, repeatCount) * 0.08);
+  multiplier += streakBonus;
+
+  // First hit when direction flips should feel much stronger.
+  if (isFirstReversalHit) {
+    multiplier += 0.45;
+  }
+
   // Keep personality impact bounded and add controlled variation.
   multiplier = clamp(multiplier, 0.35, 1.8);
-  multiplier *= randomFactor(0.88, 1.12);
+
+  const randomSpread = Math.max(0.03, 0.12 - Math.min(0.09, Math.max(0, repeatCount) * 0.015));
+  multiplier *= randomFactor(1 - randomSpread, 1 + randomSpread);
 
   const adjusted = Math.round(baseDelta * multiplier);
 
@@ -111,61 +171,97 @@ function adjustedDelta(npc, actionId, stat, baseDelta) {
   return 0;
 }
 
+function getNpcBehaviorProfile(npc) {
+  const personality = npc?.personality ?? {};
+  const traits = Array.isArray(npc?.traits) ? npc.traits : [];
+  const traitSet = new Set(traits);
+
+  return {
+    isCoward: traitSet.has("coward"),
+    isBrave: traitSet.has("brave"),
+    isGreedy: traitSet.has("greedy"),
+    isLoyal: traitSet.has("loyal"),
+    aggression: Number(personality.aggression ?? 50),
+    greed: Number(personality.greed ?? 50),
+    loyalty: Number(personality.loyalty ?? 50)
+  };
+}
+
 function getFactionById(state, factionId) {
+  const byId = state?._factionById;
+  if (byId instanceof Map) {
+    return byId.get(factionId) ?? null;
+  }
   return (state?.factions ?? []).find(f => f.id === factionId) ?? null;
 }
 
 function normalizeFactionLinkIds(state, factionIds, sourceFactionId) {
   const ids = Array.isArray(factionIds) ? factionIds : [];
   const resolved = [];
+  const seen = new Set();
 
   for (const rawId of ids) {
     const id = String(rawId ?? "").trim();
     if (!id || id === sourceFactionId) continue;
-    if (!state.factions.some(f => f.id === id)) continue;
-    if (!resolved.includes(id)) resolved.push(id);
+    if (!getFactionById(state, id)) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    resolved.push(id);
   }
 
   return resolved;
 }
 
-function applyFactionSpillover(state, sourceFactionId, delta, visited = new Set()) {
+function applyFactionSpillover(state, sourceFactionId, delta) {
   if (!sourceFactionId || delta === 0) return;
-  if (visited.has(sourceFactionId)) return;
-  visited.add(sourceFactionId);
 
-  const sourceFaction = getFactionById(state, sourceFactionId);
-  if (!sourceFaction) return;
+  const queue = [{ factionId: sourceFactionId, delta, depth: 0 }];
+  const visited = new Set([sourceFactionId]);
+  const maxDepth = 3;
 
-  const affiliatedSet = new Set(normalizeFactionLinkIds(state, sourceFaction.affiliatedFactions, sourceFactionId));
-  const hatedSet = new Set(normalizeFactionLinkIds(state, sourceFaction.hatedFactions, sourceFactionId));
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const { factionId, delta: currentDelta, depth } = current;
+    if (depth > maxDepth) continue;
 
-  for (const id of affiliatedSet) {
-    hatedSet.delete(id);
-  }
+    const sourceFaction = getFactionById(state, factionId);
+    if (!sourceFaction) continue;
 
-  const spillover = Math.max(1, Math.floor(Math.abs(delta) * Math.random() * 0.2));
+    const affiliatedSet = new Set(normalizeFactionLinkIds(state, sourceFaction.affiliatedFactions, factionId));
+    const hatedSet = new Set(normalizeFactionLinkIds(state, sourceFaction.hatedFactions, factionId));
 
-  for (const affFactionId of affiliatedSet) {
-    const linked = getFactionById(state, affFactionId);
-    if (!linked) continue;
-    const nextRep = clamp((linked.reputation ?? 0) + (delta > 0 ? spillover : -spillover));
-    linked.reputation = nextRep;
-    state.player.reputation[affFactionId] = nextRep;
-  }
+    for (const id of affiliatedSet) {
+      hatedSet.delete(id);
+    }
 
-  for (const hatedFactionId of hatedSet) {
-    const linked = getFactionById(state, hatedFactionId);
-    if (!linked) continue;
-    const nextRep = clamp((linked.reputation ?? 0) + (delta > 0 ? -spillover : spillover));
-    linked.reputation = nextRep;
-    state.player.reputation[hatedFactionId] = nextRep;
-  }
+    const spillover = Math.max(1, Math.floor(Math.abs(currentDelta) * Math.random() * 0.2));
 
-  // Optional cascade: let directly linked affiliated factions propagate once more,
-  // but avoid infinite loops with the visited set.
-  for (const affFactionId of affiliatedSet) {
-    applyFactionSpillover(state, affFactionId, delta > 0 ? spillover : -spillover, visited);
+    for (const affFactionId of affiliatedSet) {
+      const linked = getFactionById(state, affFactionId);
+      if (!linked) continue;
+
+      const nextRep = clamp((linked.reputation ?? 0) + (currentDelta > 0 ? spillover : -spillover));
+      linked.reputation = nextRep;
+      state.player.reputation[affFactionId] = nextRep;
+
+      if (!visited.has(affFactionId)) {
+        visited.add(affFactionId);
+        queue.push({
+          factionId: affFactionId,
+          delta: currentDelta > 0 ? spillover : -spillover,
+          depth: depth + 1
+        });
+      }
+    }
+
+    for (const hatedFactionId of hatedSet) {
+      const linked = getFactionById(state, hatedFactionId);
+      if (!linked) continue;
+
+      const nextRep = clamp((linked.reputation ?? 0) + (currentDelta > 0 ? -spillover : spillover));
+      linked.reputation = nextRep;
+      state.player.reputation[hatedFactionId] = nextRep;
+    }
   }
 }
 
@@ -181,15 +277,15 @@ function applyFactionSpillover(state, sourceFactionId, delta, visited = new Set(
  * @returns {Array<{ text, weight, tone }>}
  */
 function buildOutcomes(actionId, npc, action) {
-  const { traits = [], personality = {} } = npc;
+  const profile = getNpcBehaviorProfile(npc);
 
-  const isCoward    = traits.includes("coward");
-  const isBrave     = traits.includes("brave");
-  const isGreedy    = traits.includes("greedy");
-  const isLoyal     = traits.includes("loyal");
-  const aggression  = personality.aggression  ?? 50;
-  const greed       = personality.greed       ?? 50;
-  const loyalty     = personality.loyalty     ?? 50;
+  const isCoward    = profile.isCoward;
+  const isBrave     = profile.isBrave;
+  const isGreedy    = profile.isGreedy;
+  const isLoyal     = profile.isLoyal;
+  const aggression  = profile.aggression;
+  const greed       = profile.greed;
+  const loyalty     = profile.loyalty;
 
   // ── HELP ────────────────────────────────────────────────────────────────
   if (actionId === "help") {
@@ -399,7 +495,7 @@ function adjustFactionRep(state, npc, actionId) {
 
 // ── Same-faction social penalty ──────────────────────────────────────────────
 
-function applyGuildRespectPenalty(state, targetNpc, actionId) {
+function applyGuildRespectPenalty(state, targetNpc, actionId, changedNpcIds) {
   if (actionId !== "threaten") return;
   if (!targetNpc.factionId) return;
   if (targetNpc.dead) return;
@@ -409,11 +505,13 @@ function applyGuildRespectPenalty(state, targetNpc, actionId) {
     if (npc.factionId !== targetNpc.factionId) continue;
     if (npc.dead) continue;
     if (!npc.stats || typeof npc.stats.respect !== "number") continue;
+    const before = npc.stats.respect;
     npc.stats.respect = clamp(npc.stats.respect - 3);
+    if (npc.stats.respect !== before) changedNpcIds.add(npc.id);
   }
 }
 
-function applySameGuildThreatTrustLoss(state, targetNpc, actionId, targetTrustDelta) {
+function applySameGuildThreatTrustLoss(state, targetNpc, actionId, targetTrustDelta, changedNpcIds) {
   if (actionId !== "threaten") return;
   if (!targetNpc.factionId) return;
   if (targetNpc.dead) return;
@@ -428,12 +526,14 @@ function applySameGuildThreatTrustLoss(state, targetNpc, actionId, targetTrustDe
     if (npc.dead) continue;
     if (!npc.stats || typeof npc.stats.trust !== "number") continue;
 
+    const before = npc.stats.trust;
     npc.stats.trust = clamp(npc.stats.trust - spilloverLoss);
+    if (npc.stats.trust !== before) changedNpcIds.add(npc.id);
     npc.state.mood = deriveMood(npc.stats);
   }
 }
 
-function applySameGuildHelpTrust(state, targetNpc, actionId, targetTrustDelta) {
+function applySameGuildHelpTrust(state, targetNpc, actionId, targetTrustDelta, changedNpcIds) {
   if (actionId !== "help") return;
   if (!targetNpc.factionId) return;
   if (targetNpc.dead) return;
@@ -447,7 +547,9 @@ function applySameGuildHelpTrust(state, targetNpc, actionId, targetTrustDelta) {
     if (npc.dead) continue;
     if (!npc.stats || typeof npc.stats.trust !== "number") continue;
 
+    const before = npc.stats.trust;
     npc.stats.trust = clamp(npc.stats.trust + spillover);
+    if (npc.stats.trust !== before) changedNpcIds.add(npc.id);
     npc.state.mood = deriveMood(npc.stats);
   }
 }
@@ -463,8 +565,31 @@ function applySameGuildHelpTrust(state, targetNpc, actionId, targetTrustDelta) {
  * @returns {{ outcome: object, npc: object, statDeltas: object }}
  */
 export function applyAction(state, npcId, actionId) {
-  const npc = state.npcs.find(n => n.id === npcId);
+  const npc = (state?._npcById instanceof Map ? state._npcById.get(npcId) : null)
+    ?? state.npcs.find(n => n.id === npcId);
   if (!npc) throw new Error(`[npcEngine] NPC not found: ${npcId}`);
+
+  const beforeNpcStateById = new Map();
+  for (const item of (state.npcs ?? [])) {
+    beforeNpcStateById.set(item.id, {
+      mood: item?.state?.mood ?? "neutral",
+      stats: { ...(item?.stats ?? {}) }
+    });
+  }
+
+  const beforeFactionRep = new Map();
+  for (const faction of (state.factions ?? [])) {
+    if (!faction?.id) continue;
+    const value = Number(state.player?.reputation?.[faction.id] ?? faction.reputation ?? 0);
+    beforeFactionRep.set(faction.id, value);
+  }
+  for (const [id, value] of Object.entries(state.player?.reputation ?? {})) {
+    if (!beforeFactionRep.has(id)) {
+      beforeFactionRep.set(id, Number(value ?? 0));
+    }
+  }
+
+  const changedNpcIds = new Set([npc.id]);
 
   if (npc.dead) {
     return {
@@ -477,6 +602,8 @@ export function applyAction(state, npcId, actionId) {
   const action = state.system.actions.find(a => a.id === actionId);
   if (!action) throw new Error(`[npcEngine] Action not found: ${actionId}`);
 
+  const prevMood = npc.state?.mood ?? "neutral";
+
   // 1. Build weighted outcomes
   const outcomes = buildOutcomes(actionId, npc, action);
 
@@ -485,10 +612,26 @@ export function applyAction(state, npcId, actionId) {
 
   // 3. Apply stat effects
   const statDeltas = {};
-  for (const [stat, delta] of Object.entries(action.effects)) {
+  const effectKeys = Object.keys(action.effects ?? {});
+  const rangeKeys = Object.keys(action.ranges ?? {});
+  const allStats = Array.from(new Set([...effectKeys, ...rangeKeys]));
+
+  for (const stat of allStats) {
+    // Skip stats that are disabled for this action
+    if (action.ranges?.[stat]?.enabled === false) {
+      continue;
+    }
+
+    const fallbackDelta = Number(action.effects?.[stat] ?? 0);
+    const baseDelta = rollBaseDelta(action, stat, fallbackDelta);
     if (stat in npc.stats) {
+      const directionSign = signOf(baseDelta);
+      const repeatCount = getConsecutiveStatDirectionCount(npc.memory, stat, directionSign);
+      const lastSign = getLastNonZeroStatSign(npc.memory, stat);
+      const isFirstReversalHit = directionSign !== 0 && lastSign !== 0 && directionSign !== lastSign;
+
       const before = npc.stats[stat];
-      const modDelta = adjustedDelta(npc, actionId, stat, delta);
+      const modDelta = adjustedDelta(npc, actionId, stat, baseDelta, repeatCount, isFirstReversalHit);
       if (stat === "fear") {
         npc.stats[stat] = clamp(before + modDelta, 0, fearCapForNPC(npc));
       } else if (stat === "trust") {
@@ -499,47 +642,127 @@ export function applyAction(state, npcId, actionId) {
         npc.stats[stat] = clamp(before + modDelta);
       }
       statDeltas[stat] = npc.stats[stat] - before; // actual change (may be less at boundary)
+      if (statDeltas[stat] !== 0) changedNpcIds.add(npc.id);
     }
   }
 
-  // Recompute readiness for all NPCs so hostility reflects current social state.
-  const readinessBefore = npc.stats.readiness ?? readinessForNPC(npc);
-  for (const n of state.npcs) {
-    n.stats.readiness = readinessForNPC(n);
-  }
-  const readinessAfter = npc.stats.readiness;
-  if (readinessAfter !== readinessBefore) {
-    statDeltas.readiness = readinessAfter - readinessBefore;
+  // 4. Adjust faction reputation
+  adjustFactionRep(state, npc, actionId);
+
+  // 5. Nearby guild members lose respect when one of their own is threatened.
+  applyGuildRespectPenalty(state, npc, actionId, changedNpcIds);
+
+  // 6. Threatening one member makes guild mates trust you less (up to half).
+  applySameGuildThreatTrustLoss(state, npc, actionId, statDeltas.trust ?? 0, changedNpcIds);
+
+  // 7. Helping one member slightly improves trust among their guild mates (up to half).
+  applySameGuildHelpTrust(state, npc, actionId, statDeltas.trust ?? 0, changedNpcIds);
+
+  // Recompute readiness only for NPCs actually changed by this action.
+  for (const id of changedNpcIds) {
+    const target = (state?._npcById instanceof Map ? state._npcById.get(id) : null)
+      ?? state.npcs.find(n => n.id === id);
+    if (!target?.stats) continue;
+    const beforeReadiness = Number(target.stats.readiness ?? readinessForNPC(target));
+    const nextReadiness = readinessForNPC(target);
+    target.stats.readiness = nextReadiness;
+    if (id === npc.id && nextReadiness !== beforeReadiness) {
+      statDeltas.readiness = nextReadiness - beforeReadiness;
+    }
   }
 
-  // 4. Update mood
-  const prevMood = npc.state.mood;
-  npc.state.mood = deriveMood(npc.stats);
+  // 8. Update mood for all affected NPCs after final stat changes.
+  for (const id of changedNpcIds) {
+    const target = (state?._npcById instanceof Map ? state._npcById.get(id) : null)
+      ?? state.npcs.find(n => n.id === id);
+    if (!target?.stats || !target?.state) continue;
+    target.state.mood = deriveMood(target.stats);
+  }
 
-  // 5. Record memory entry
+  const factionChanges = [];
+  const knownFactionIds = new Set([
+    ...beforeFactionRep.keys(),
+    ...Object.keys(state.player?.reputation ?? {}),
+    ...(state.factions ?? []).map(f => f.id).filter(Boolean)
+  ]);
+
+  for (const factionId of knownFactionIds) {
+    const before = Number(beforeFactionRep.get(factionId) ?? 0);
+    const after = Number(
+      state.player?.reputation?.[factionId]
+      ?? getFactionById(state, factionId)?.reputation
+      ?? before
+    );
+    const delta = after - before;
+    if (delta !== 0) {
+      factionChanges.push({ factionId, delta, next: after });
+    }
+  }
+
+  const affectedNpcs = Array.from(changedNpcIds)
+    .filter(id => id !== npc.id)
+    .map(id => {
+      const found = (state?._npcById instanceof Map ? state._npcById.get(id) : null)
+        ?? state.npcs.find(n => n.id === id);
+      return {
+        id,
+        name: found?.name ?? id
+      };
+    });
+
+  // 9. Record memory entry on target NPC.
   npc.memory.push({
     timestamp: Date.now(),
     actionId,
     outcome: outcome.text,
     statDeltas,
     moodBefore: prevMood,
-    moodAfter: npc.state.mood
+    moodAfter: npc.state.mood,
+    sourceNpcId: npc.id,
+    sourceNpcName: npc.name,
+    sourceKind: "direct",
+    factionChanges,
+    affectedNpcs
   });
 
-  // Keep memory to last 20 entries
   if (npc.memory.length > 20) npc.memory = npc.memory.slice(-20);
 
-  // 6. Adjust faction reputation
-  adjustFactionRep(state, npc, actionId);
+  for (const changedId of changedNpcIds) {
+    if (changedId === npc.id) continue;
+    const otherNpc = (state?._npcById instanceof Map ? state._npcById.get(changedId) : null)
+      ?? state.npcs.find(n => n.id === changedId);
+    if (!otherNpc) continue;
 
-  // 7. Nearby guild members lose respect when one of their own is threatened.
-  applyGuildRespectPenalty(state, npc, actionId);
+    const before = beforeNpcStateById.get(changedId) ?? { mood: "neutral", stats: {} };
+    const nextStats = otherNpc.stats ?? {};
+    const statKeys = new Set([...Object.keys(before.stats ?? {}), ...Object.keys(nextStats)]);
+    const spilloverDeltas = {};
+    for (const key of statKeys) {
+      const prevVal = Number(before.stats?.[key] ?? 0);
+      const nextVal = Number(nextStats?.[key] ?? 0);
+      const delta = nextVal - prevVal;
+      if (delta !== 0) spilloverDeltas[key] = delta;
+    }
 
-  // 8. Threatening one member makes guild mates trust you less (up to half).
-  applySameGuildThreatTrustLoss(state, npc, actionId, statDeltas.trust ?? 0);
+    const moodBefore = before.mood ?? "neutral";
+    const moodAfter = otherNpc.state?.mood ?? moodBefore;
+    if (Object.keys(spilloverDeltas).length === 0 && moodBefore === moodAfter) continue;
 
-  // 9. Helping one member slightly improves trust among their guild mates (up to half).
-  applySameGuildHelpTrust(state, npc, actionId, statDeltas.trust ?? 0);
+    otherNpc.memory.push({
+      timestamp: Date.now(),
+      actionId,
+      outcome: `Affected by ${npc.name}'s ${actionId}.`,
+      statDeltas: spilloverDeltas,
+      moodBefore,
+      moodAfter,
+      sourceNpcId: npc.id,
+      sourceNpcName: npc.name,
+      sourceKind: "spillover",
+      factionChanges: []
+    });
 
-  return { outcome, npc, statDeltas };
+    if (otherNpc.memory.length > 20) otherNpc.memory = otherNpc.memory.slice(-20);
+  }
+
+  return { outcome, npc, statDeltas, changedNpcIds: Array.from(changedNpcIds) };
 }
