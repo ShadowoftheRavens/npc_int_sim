@@ -2,6 +2,7 @@
 
 import { applyAction } from "./npcEngine.js";
 import { saveState }   from "./storage.js";
+import { showToast }   from "./uiNotifications.js";
 
 // ── Avatar ────────────────────────────────────────────────────────────────────
 const DEFAULT_AVATAR = "👤";
@@ -316,6 +317,34 @@ function spawnDelta(el, text, positive) {
   span.addEventListener("animationend", () => span.remove(), { once: true });
 }
 
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return true;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
+
+  return copied;
+}
+
 // ── Card flash ────────────────────────────────────────────────────────────────
 function flashCard(card, tone) {
   const cls = tone === "positive" ? "flash-positive" : "flash-negative";
@@ -391,7 +420,7 @@ function buildCard(state, npc) {
   hdr.innerHTML = `
     <div class="npc-avatar">${DEFAULT_AVATAR}</div>
     <div class="npc-identity">
-      <div class="npc-name">
+      <div class="npc-name npc-name-copyable" title="Click to copy name" role="button" tabindex="0">
         ${npc.name}
         ${custom ? '<span class="npc-custom-badge">custom</span>' : ""}
       </div>
@@ -468,6 +497,7 @@ function buildCard(state, npc) {
   card.querySelector(".npc-delete-btn")?.setAttribute("aria-label", `Delete ${npc.name}`);
   card.querySelector(".npc-dead-input")?.setAttribute("aria-label", `Mark ${npc.name} as dead`);
   card.querySelector(".npc-history-btn")?.setAttribute("aria-label", `Toggle action history for ${npc.name}`);
+  card.querySelector(".npc-name-copyable")?.setAttribute("aria-label", `Copy ${npc.name} to clipboard`);
 
   // ── Wire edit / delete
   card.querySelector(".npc-notes-btn")?.addEventListener("click", e => {
@@ -501,6 +531,30 @@ function buildCard(state, npc) {
     const willOpen = historyEl.classList.contains("npc-history-collapsed");
     historyEl.classList.toggle("npc-history-collapsed", !willOpen);
     e.currentTarget?.setAttribute("aria-expanded", willOpen ? "true" : "false");
+  });
+
+  const nameCopyTarget = card.querySelector(".npc-name-copyable");
+  const copyNpcName = async () => {
+    try {
+      const copied = await copyTextToClipboard(npc.name);
+      showToast(copied ? `Copied ${npc.name}` : "Could not copy name", copied ? "ok" : "err");
+    } catch (e) {
+      console.warn("[ui] copy name failed", e);
+      showToast("Could not copy name", "err");
+    }
+  };
+
+  nameCopyTarget?.addEventListener("click", e => {
+    e.stopPropagation();
+    copyNpcName();
+  });
+
+  nameCopyTarget?.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      e.stopPropagation();
+      copyNpcName();
+    }
   });
 
   return card;
